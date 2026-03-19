@@ -56,14 +56,42 @@ The app automatically selects viewer rotation from `KOBRA_MODEL_CODE`:
 Optional override in `/useremain/rinkhals/klipperscreen-viewer.conf`:
 
 ```bash
-VNC_HOST=<rpi-ip>
+VNC_HOST=<rpi-ip-or-hostname>
 VNC_PORT=5900
 VNC_PASSWORD=
 VIEWER_ROTATION=
+VNC_COLOR_DEPTH=16
+VNC_UPDATE_INTERVAL_MS=66
+VNC_DIRECT_RENDER=1
+UI_KILL_DEBUG=0
+VIEWER_BOOT_DELAY_SEC=15
+VIEWER_EXIT_HOLD_MS=5000
+VIEWER_EXIT_CORNER_PX=0
+VIEWER_EXIT_MOVE_TOL_PX=0
 ```
+
+`VNC_HOST` accepts either an IPv4 address or a hostname. If a hostname is set,
+the app attempts to resolve it to IPv4 at startup before connecting.
 
 Set `VIEWER_ROTATION` to `0`, `90`, `180`, or `270` only if the automatic model
 mapping is wrong for your setup.
+
+Performance tuning:
+- `VNC_COLOR_DEPTH=16` lowers CPU and bandwidth on the printer.
+- `VNC_UPDATE_INTERVAL_MS=50..100` trades smoothness for lower load.
+- `VNC_DIRECT_RENDER=1` (default) removes backbuffer flip memcpy for lower CPU.
+- Set `VNC_DIRECT_RENDER=0` if you prefer the older tear-reduction path.
+- `UI_KILL_DEBUG=1` logs UI takeover kills to `/tmp/rinkhals/app-fb-vnc-viewer-ui-kill.log`.
+- `VIEWER_BOOT_DELAY_SEC=15` delays startup during Rinkhals boot only (non-blocking wrapper).
+- Hold the physical top-left corner for `VIEWER_EXIT_HOLD_MS` (default `5000`) to stop the viewer locally.
+- `VIEWER_EXIT_CORNER_PX=0` auto-sizes the trigger zone from the screen size.
+- `VIEWER_EXIT_MOVE_TOL_PX=0` auto-sizes allowed finger drift while holding.
+- If the VNC server is temporarily unavailable, the viewer now stays running and
+  retries connection every 5 seconds until stopped.
+
+Startup architecture:
+- `app.sh` is a non-blocking launcher wrapper and should return immediately.
+- Real start/stop logic runs in `app_real.sh`.
 
 ## Raspberry Pi setup
 
@@ -86,6 +114,18 @@ Supported arguments:
 - `--height <pixels>`
 - `--port <port>`
 - `--rotation <deg>`
+- `--depth <16|24>`
+- `--quality <0-9>`
+- `--compress <0-9>`
+
+Note: `--quality` / `--compress` are applied only if your `Xtigervnc` build
+supports those options; otherwise they are skipped automatically.
+
+Recommended low-CPU Pi-side settings:
+
+```bash
+sudo bash rpi-setup.sh --profile k3 --depth 16 --quality 5 --compress 7
+```
 
 Pi-side profile mapping:
 

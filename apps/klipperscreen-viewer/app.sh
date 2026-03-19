@@ -1,155 +1,117 @@
 #!/bin/sh
+# Non-blocking launch wrapper for klipperscreen-viewer.
+# Keeps app.sh fast for Rinkhals start timeout constraints.
 
 . /useremain/rinkhals/.current/tools.sh
 
-APP_ROOT=$(dirname $(realpath $0))
-BIN="$APP_ROOT/bin/fb-vnc-viewer"
-
-# Config is stored outside app folder so updates don't overwrite user settings.
+APP_ROOT=$(dirname "$(realpath "$0")")
+REAL_SCRIPT="${ORIG_SCRIPT:-"$APP_ROOT/app_real.sh"}"
 CONF_FILE="/useremain/rinkhals/klipperscreen-viewer.conf"
-if [ ! -f "$CONF_FILE" ]; then
-    cp "$APP_ROOT/klipperscreen-viewer.conf" "$CONF_FILE"
-fi
 
-VNC_HOST=""
-VNC_PORT="5900"
-VNC_PASSWORD=""
-VIEWER_ROTATION=""
-. "$CONF_FILE"
+VIEWER_BOOT_DELAY_SEC="15"
+[ -f "$CONF_FILE" ] && . "$CONF_FILE"
 
-case "$KOBRA_MODEL_CODE" in
-    KS1)
-        PROFILE="ks1"
-        VNC_WIDTH=800
-        VNC_HEIGHT=480
-        DEFAULT_ROTATION=180
-        ;;
-    KS1M)
-        PROFILE="ks1m"
-        VNC_WIDTH=800
-        VNC_HEIGHT=480
-        DEFAULT_ROTATION=180
-        ;;
-    K3M)
-        PROFILE="k3m"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=90
-        ;;
-    K2P)
-        PROFILE="k2p"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
-        ;;
-    K3)
-        PROFILE="k3"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
-        ;;
-    K3V2)
-        PROFILE="k3v2"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
-        ;;
-    *)
-        PROFILE="k3"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
-        ;;
-esac
+STATE_DIR="${RINKHALS_LOGS:-/tmp/rinkhals}"
+WAIT_PID_FILE="$STATE_DIR/klipperscreen-viewer.wait.pid"
+WAIT_UNTIL_FILE="$STATE_DIR/klipperscreen-viewer.wait.until"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-ROTATION="${VIEWER_ROTATION:-$DEFAULT_ROTATION}"
-
-status() {
-    PIDS=$(get_by_name fb-vnc-viewer)
-    if [ "$PIDS" = "" ]; then
-        report_status $APP_STATUS_STOPPED
-    else
-        report_status $APP_STATUS_STARTED "$PIDS"
-    fi
+sanitize_delay() {
+    case "${1:-}" in
+        ''|*[!0-9]*)
+            echo "15"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
 }
 
-_restart_k3sysui() {
-    SYSUI=/userdata/app/gk/K3SysUi.patch
-    if [ -f "$SYSUI" ]; then
-        cd /userdata/app/gk
-        ./${SYSUI##*/} >> "$RINKHALS_LOGS/K3SysUi.log" 2>&1 &
-        cd - > /dev/null
+parent_cmdline() {
+    tr '\000' ' ' < "/proc/$PPID/cmdline" 2>/dev/null
+}
+
+launcher_alive() {
+    [ -f "$WAIT_PID_FILE" ] || return 1
+    PID=$(cat "$WAIT_PID_FILE" 2>/dev/null || true)
+    [ -n "$PID" ] || return 1
+    kill -0 "$PID" 2>/dev/null
+}
+
+start_async() {
+    DELAY="$1"
+
+    if launcher_alive; then
+        echo "klipperscreen-viewer: start already scheduled (pid $(cat "$WAIT_PID_FILE" 2>/dev/null))."
+        return 0
     fi
+
+    rm -f "$WAIT_PID_FILE" "$WAIT_UNTIL_FILE" 2>/dev/null || true
+    UNTIL_TS=$(( $(date +%s) + DELAY ))
+    echo "$UNTIL_TS" > "$WAIT_UNTIL_FILE"
+
+    setsid nohup sh -c "
+        sleep $DELAY
+        \"$REAL_SCRIPT\" start || true
+        rm -f \"$WAIT_PID_FILE\" \"$WAIT_UNTIL_FILE\" 2>/dev/null || true
+    " >> "$STATE_DIR/app-fb-vnc-viewer-launchwrapper.log" 2>&1 &
+
+    echo "$!" > "$WAIT_PID_FILE"
+    return 0
 }
 
 start() {
-    if [ ! -x "$BIN" ]; then
-        chmod +x "$BIN" 2>/dev/null
+    PARENT="$(parent_cmdline)"
+    BOOT_DELAY="$(sanitize_delay "$VIEWER_BOOT_DELAY_SEC")"
+
+    DELAY=0
+    case "$PARENT" in
+        *start.sh*)
+            DELAY="$BOOT_DELAY"
+            ;;
+    esac
+
+    start_async "$DELAY"
+}
+
+status() {
+    if launcher_alive; then
+        REM=""
+        if [ -f "$WAIT_UNTIL_FILE" ]; then
+            UNTIL_TS=$(cat "$WAIT_UNTIL_FILE" 2>/dev/null || echo 0)
+            NOW_TS=$(date +%s)
+            DELTA=$(( UNTIL_TS - NOW_TS ))
+            [ "$DELTA" -lt 0 ] && DELTA=0
+            REM=" (~${DELTA}s remaining)"
+        fi
+        echo "launchwrapper: delayed start pending; launcher PID $(cat "$WAIT_PID_FILE" 2>/dev/null)${REM}"
+    else
+        rm -f "$WAIT_PID_FILE" "$WAIT_UNTIL_FILE" 2>/dev/null || true
     fi
 
-    if [ ! -x "$BIN" ]; then
-        echo "Error: $BIN is missing or not executable" >&2
-        echo "Build it with: /build/build-klipperscreen-viewer-bin.sh" >&2
-        report_status $APP_STATUS_STOPPED
-        return 1
-    fi
-
-    if [ -z "$VNC_HOST" ]; then
-        echo "Error: VNC_HOST not configured in $CONF_FILE" >&2
-        report_status $APP_STATUS_STOPPED
-        return 1
-    fi
-
-    kill_by_name fb-vnc-viewer
-
-    # Ensure nothing races us for /dev/input/event0 and framebuffer ownership.
-    kill_by_name K3SysUi
-    sleep 1
-    kill_by_name rinkhals-ui.py
-
-    echo "Connecting to VNC at $VNC_HOST:$VNC_PORT (profile=$PROFILE expected=${VNC_WIDTH}x${VNC_HEIGHT} rotation=$ROTATION)"
-
-    VNC_PASSWORD="${VNC_PASSWORD:-}" \
-    "$BIN" \
-        -r "$ROTATION" \
-        -p "$VNC_PORT" \
-        "$VNC_HOST" \
-        >> "$RINKHALS_LOGS/app-fb-vnc-viewer.log" 2>&1 &
-
-    sleep 2
-    PIDS=$(get_by_name fb-vnc-viewer)
-    if [ -z "$PIDS" ]; then
-        echo "Failed to start fb-vnc-viewer - see $RINKHALS_LOGS/app-fb-vnc-viewer.log" >&2
-        _restart_k3sysui
-        report_status $APP_STATUS_STOPPED
-        return 1
-    fi
+    "$REAL_SCRIPT" status
 }
 
 stop() {
-    kill_by_name fb-vnc-viewer
-    _restart_k3sysui
+    if launcher_alive; then
+        kill "$(cat "$WAIT_PID_FILE" 2>/dev/null)" 2>/dev/null || true
+    fi
+    rm -f "$WAIT_PID_FILE" "$WAIT_UNTIL_FILE" 2>/dev/null || true
+
+    "$REAL_SCRIPT" stop
 }
 
 version() {
-    echo "1.0.0"
+    "$REAL_SCRIPT" version
 }
 
-case "$1" in
-    status)
-        status
-        ;;
-    start)
-        start
-        ;;
-    stop)
-        stop
-        ;;
-    version)
-        version
-        ;;
+case "${1:-}" in
+    start)  start ;;
+    stop)   stop ;;
+    status) status ;;
+    version) version ;;
     *)
-        echo "Usage: $0 {status|start|stop|version}" >&2
+        echo "Usage: $0 {start|stop|status|version}" >&2
         exit 1
         ;;
 esac

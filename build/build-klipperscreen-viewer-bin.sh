@@ -15,7 +15,33 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
+ensure_arm_emulation() {
+    if docker run --rm --platform=linux/arm/v7 debian:12 /bin/sh -lc 'echo ok' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    cat >&2 <<'EOF'
+ERROR: ARM container emulation is not available on this host.
+
+This build runs an ARMv7 Docker image. Your Docker engine currently cannot execute
+/bin/sh inside that image (exec format error), which usually means binfmt/qemu is missing.
+
+Enable it once on the host, then re-run this script:
+
+  docker run --privileged --rm tonistiigi/binfmt --install arm
+
+Alternative (distribution packages):
+  sudo apt-get install -y qemu-user-static binfmt-support
+
+Then verify:
+  docker run --rm --platform=linux/arm/v7 debian:12 /bin/sh -lc 'uname -m'
+EOF
+    exit 1
+}
+
 mkdir -p "$APP_DIR/bin"
+
+ensure_arm_emulation
 
 echo "[1/2] Building ARM static binary in isolated container..."
 docker run --rm \
@@ -50,7 +76,7 @@ docker run --rm \
 
     cmake --build libvncserver-build --target vncclient -j"$(nproc)"
 
-    gcc -O2 -pipe -static \
+    gcc -O3 -pipe -static \
       -I/tmp/libvncserver/include \
       -I/tmp/libvncserver-build/include \
       /work/app/src/fb-vnc-viewer.c \
