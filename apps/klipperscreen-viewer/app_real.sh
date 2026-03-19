@@ -15,8 +15,11 @@ VNC_HOST=""
 VNC_PORT="5900"
 VNC_PASSWORD=""
 VIEWER_ROTATION=""
-VNC_COLOR_DEPTH="16"
-VNC_UPDATE_INTERVAL_MS="66"
+VIEWER_TOUCH_ROTATION=""
+VIEWER_TOUCH_SWAP_XY=""
+VIEWER_TOUCH_DEVICE=""
+VNC_COLOR_DEPTH="32"
+VNC_UPDATE_INTERVAL_MS="125"
 VNC_DIRECT_RENDER="1"
 UI_KILL_DEBUG="0"
 VIEWER_EXIT_HOLD_MS="5000"
@@ -113,52 +116,103 @@ ui_debug_log() {
     echo "$(date): $*" >> "$RINKHALS_LOGS/app-fb-vnc-viewer-ui-kill.log"
 }
 
+detect_touch_device() {
+    FIRST_ABS=""
+
+    for DEV in /dev/input/event*; do
+        [ -e "$DEV" ] || continue
+
+        EVENT_NAME=$(basename "$DEV")
+        SYS_DIR="/sys/class/input/$EVENT_NAME/device"
+        [ -d "$SYS_DIR" ] || continue
+
+        ABS_CAP=$(cat "$SYS_DIR/capabilities/abs" 2>/dev/null)
+        [ -n "$ABS_CAP" ] || continue
+        [ "$ABS_CAP" != "0" ] || continue
+
+        if [ -z "$FIRST_ABS" ]; then
+            FIRST_ABS="$DEV"
+        fi
+
+        INPUT_NAME=$(cat "$SYS_DIR/name" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+        case "$INPUT_NAME" in
+            *touch*|*focaltech*|*goodix*|*ft5*|*fts*|*gsl*|*ilitek*|*edt-ft5x06*|*cst*|*capacitive*)
+                echo "$DEV"
+                return 0
+                ;;
+        esac
+    done
+
+    if [ -n "$FIRST_ABS" ]; then
+        echo "$FIRST_ABS"
+        return 0
+    fi
+
+    return 1
+}
+
 case "$KOBRA_MODEL_CODE" in
     KS1)
         PROFILE="ks1"
         VNC_WIDTH=800
         VNC_HEIGHT=480
         DEFAULT_ROTATION=180
+        DEFAULT_TOUCH_ROTATION=180
+        DEFAULT_TOUCH_SWAP_XY=0
         ;;
     KS1M)
         PROFILE="ks1m"
         VNC_WIDTH=800
         VNC_HEIGHT=480
         DEFAULT_ROTATION=180
+        DEFAULT_TOUCH_ROTATION=180
+        DEFAULT_TOUCH_SWAP_XY=0
         ;;
     K3M)
         PROFILE="k3m"
         VNC_WIDTH=480
         VNC_HEIGHT=272
         DEFAULT_ROTATION=90
+        DEFAULT_TOUCH_ROTATION=90
+        DEFAULT_TOUCH_SWAP_XY=0
         ;;
     K2P)
         PROFILE="k2p"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
+        VNC_WIDTH=272
+        VNC_HEIGHT=480
+        DEFAULT_ROTATION=90
+        DEFAULT_TOUCH_ROTATION=180
+        DEFAULT_TOUCH_SWAP_XY=1
         ;;
     K3)
         PROFILE="k3"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
+        VNC_WIDTH=272
+        VNC_HEIGHT=480
+        DEFAULT_ROTATION=90
+        DEFAULT_TOUCH_ROTATION=180
+        DEFAULT_TOUCH_SWAP_XY=1
         ;;
     K3V2)
         PROFILE="k3v2"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
+        VNC_WIDTH=272
+        VNC_HEIGHT=480
+        DEFAULT_ROTATION=90
+        DEFAULT_TOUCH_ROTATION=180
+        DEFAULT_TOUCH_SWAP_XY=1
         ;;
     *)
         PROFILE="k3"
-        VNC_WIDTH=480
-        VNC_HEIGHT=272
-        DEFAULT_ROTATION=270
+        VNC_WIDTH=272
+        VNC_HEIGHT=480
+        DEFAULT_ROTATION=90
+        DEFAULT_TOUCH_ROTATION=180
+        DEFAULT_TOUCH_SWAP_XY=1
         ;;
 esac
 
 ROTATION="${VIEWER_ROTATION:-$DEFAULT_ROTATION}"
+TOUCH_ROTATION="${VIEWER_TOUCH_ROTATION:-$DEFAULT_TOUCH_ROTATION}"
+TOUCH_SWAP_XY="${VIEWER_TOUCH_SWAP_XY:-$DEFAULT_TOUCH_SWAP_XY}"
 
 status() {
     PIDS=$(get_by_name fb-vnc-viewer)
@@ -246,6 +300,7 @@ kill_ui_retry_bg() {
 
 start() {
     CONNECT_HOST="$VNC_HOST"
+    TOUCH_DEVICE="$VIEWER_TOUCH_DEVICE"
 
     if [ ! -x "$BIN" ]; then
         chmod +x "$BIN" 2>/dev/null
@@ -274,12 +329,17 @@ start() {
         fi
     fi
 
+    if [ -z "$TOUCH_DEVICE" ]; then
+        TOUCH_DEVICE=$(detect_touch_device || true)
+        [ -n "$TOUCH_DEVICE" ] || TOUCH_DEVICE="/dev/input/event0"
+    fi
+
     kill_by_name fb-vnc-viewer
 
     # Fire-and-return start path: do one immediate UI kill pass, then continue in background.
     kill_ui_once
 
-    echo "Connecting to VNC at $CONNECT_HOST:$VNC_PORT (profile=$PROFILE expected=${VNC_WIDTH}x${VNC_HEIGHT} rotation=$ROTATION depth=$VNC_COLOR_DEPTH interval=${VNC_UPDATE_INTERVAL_MS}ms direct=${VNC_DIRECT_RENDER})"
+    echo "Connecting to VNC at $CONNECT_HOST:$VNC_PORT (profile=$PROFILE expected=${VNC_WIDTH}x${VNC_HEIGHT} rotation=$ROTATION touch_rotation=$TOUCH_ROTATION touch_swap_xy=$TOUCH_SWAP_XY touch_device=$TOUCH_DEVICE depth=$VNC_COLOR_DEPTH interval=${VNC_UPDATE_INTERVAL_MS}ms direct=${VNC_DIRECT_RENDER})"
 
     HOLD_EXIT_CMD="sh $APP_ROOT/app.sh stop >/dev/null 2>&1 &"
 
@@ -287,8 +347,11 @@ start() {
     VIEWER_EXIT_CORNER_PX="$VIEWER_EXIT_CORNER_PX" \
     VIEWER_EXIT_MOVE_TOL_PX="$VIEWER_EXIT_MOVE_TOL_PX" \
     VIEWER_HOLD_EXIT_CMD="$HOLD_EXIT_CMD" \
+    VIEWER_TOUCH_ROTATION="$TOUCH_ROTATION" \
+    VIEWER_TOUCH_SWAP_XY="$TOUCH_SWAP_XY" \
     VNC_PASSWORD="${VNC_PASSWORD:-}" \
     "$BIN" \
+        -t "$TOUCH_DEVICE" \
         -r "$ROTATION" \
         -p "$VNC_PORT" \
         -b "$VNC_COLOR_DEPTH" \

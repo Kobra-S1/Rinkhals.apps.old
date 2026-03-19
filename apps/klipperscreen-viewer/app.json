@@ -3,11 +3,5 @@
 
     "name": "KlipperScreen Viewer",
     "description": "VNC viewer that displays a remote KlipperScreen on the printer touchscreen and forwards touch input back to VNC.",
-    "version": "1.0.0",
-
-    "requirements":
-    {
-        "memory": 6,
-        "cpu": 12
-    }
+    "version": "1.0.0"
 }

@@ -50,6 +50,7 @@ struct touch_state {
     int y;
     int pressed;
     int slot;          /* current MT slot being tracked */
+    int use_fb_scale;  /* use framebuffer-sized coords instead of advertised abs range */
     /* Raw coordinate range from evdev */
     int abs_min_x;
     int abs_max_x;
@@ -59,7 +60,9 @@ struct touch_state {
 
 /* Display transformation */
 struct transform {
-    int rotation;  /* 0, 90, 180, 270 */
+    int rotation;        /* render rotation: 0, 90, 180, 270 */
+    int touch_rotation;  /* touch rotation: 0, 90, 180, 270 */
+    int touch_swap_xy;   /* swap normalized touch axes before rotation */
     int fb_width;
     int fb_height;
     int vnc_width;
@@ -238,6 +241,7 @@ static int touch_open(struct touch_state *ts, const char *device)
     fprintf(stderr, "touch: abs_x=[%d..%d] abs_y=[%d..%d]\n",
             ts->abs_min_x, ts->abs_max_x, ts->abs_min_y, ts->abs_max_y);
     ts->slot = 0;
+    ts->use_fb_scale = 0;
     return 0;
 }
 
@@ -247,6 +251,38 @@ static void touch_close(struct touch_state *ts)
         ioctl(ts->fd, EVIOCGRAB, 0);
         close(ts->fd);
     }
+}
+
+static void touch_maybe_use_fb_scale(struct viewer_ctx *ctx)
+{
+    struct touch_state *ts = &ctx->touch;
+
+    if (ts->use_fb_scale)
+        return;
+
+    /* Some single-touch controllers advertise a wide raw range (for example
+     * 0..4095) but actually report coordinates already scaled close to the
+     * framebuffer size. If we trust the advertised range, all touches collapse
+     * into the VNC top-left corner. Switch to framebuffer-sized scaling once
+     * we see in-range samples that clearly match screen coordinates. */
+    if (ctx->fb.width <= 0 || ctx->fb.height <= 0)
+        return;
+    if (ts->x < 0 || ts->y < 0)
+        return;
+    if (ts->x >= ctx->fb.width || ts->y >= ctx->fb.height)
+        return;
+    if (ts->abs_max_x < ctx->fb.width * 2 || ts->abs_max_y < ctx->fb.height * 2)
+        return;
+
+    ts->abs_min_x = 0;
+    ts->abs_max_x = ctx->fb.width - 1;
+    ts->abs_min_y = 0;
+    ts->abs_max_y = ctx->fb.height - 1;
+    ts->use_fb_scale = 1;
+
+    fprintf(stderr,
+            "touch: using framebuffer-sized coordinate scaling %dx%d instead of advertised abs range\n",
+            ctx->fb.width, ctx->fb.height);
 }
 
 /* ── Coordinate transforms ───────────────────────────────────── */
@@ -272,9 +308,15 @@ static void touch_to_vnc(struct transform *xf, struct touch_state *ts,
     if (ny < 0) ny = 0;
     if (ny > 1) ny = 1;
 
+    if (xf->touch_swap_xy) {
+        float tmp = nx;
+        nx = ny;
+        ny = tmp;
+    }
+
     /* Apply rotation — maps touch position to VNC coordinate space */
     float fx, fy;
-    switch (xf->rotation) {
+    switch (xf->touch_rotation) {
     case 90:
         fx = ny;
         fy = 1.0f - nx;
@@ -311,7 +353,13 @@ static void touch_to_view(struct transform *xf, struct touch_state *ts,
     if (ny < 0) ny = 0;
     if (ny > 1) ny = 1;
 
-    switch (xf->rotation) {
+    if (xf->touch_swap_xy) {
+        float tmp = nx;
+        nx = ny;
+        ny = tmp;
+    }
+
+    switch (xf->touch_rotation) {
     case 90:
         *view_x = (int)(ny * (xf->fb_width - 1));
         *view_y = (int)((1.0f - nx) * (xf->fb_height - 1));
@@ -616,6 +664,8 @@ static void usage(const char *prog)
         "  VNC_COLOR_DEPTH        Same as -b (16 or 32)\n"
         "  VNC_UPDATE_INTERVAL_MS Same as -u\n"
         "  VNC_DIRECT_RENDER      Same as -d (0 or 1)\n"
+        "  VIEWER_TOUCH_ROTATION  Touch rotation in degrees (default: same as render)\n"
+        "  VIEWER_TOUCH_SWAP_XY   Swap touch axes before rotation (0 or 1)\n"
         "  VIEWER_EXIT_HOLD_MS    Hold top-left to stop viewer (default: 5000)\n"
         "  VIEWER_EXIT_CORNER_PX  Trigger size in px, 0=auto\n"
         "  VIEWER_EXIT_MOVE_TOL_PX Allowed drift in px, 0=auto\n"
@@ -642,6 +692,8 @@ int main(int argc, char **argv)
     int client_bpp = 32;
     int update_interval_ms = 66;
     int direct_render = 1;
+    int touch_rotation = -1;
+    int touch_swap_xy = 0;
     int exit_hold_ms = 5000;
     int exit_corner_px = 0;
     int exit_move_tol_px = 0;
@@ -661,6 +713,10 @@ int main(int argc, char **argv)
         update_interval_ms = atoi(env);
     if ((env = getenv("VNC_DIRECT_RENDER")) != NULL)
         direct_render = atoi(env);
+    if ((env = getenv("VIEWER_TOUCH_ROTATION")) != NULL)
+        touch_rotation = atoi(env);
+    if ((env = getenv("VIEWER_TOUCH_SWAP_XY")) != NULL)
+        touch_swap_xy = atoi(env);
     if ((env = getenv("VIEWER_EXIT_HOLD_MS")) != NULL)
         exit_hold_ms = atoi(env);
     if ((env = getenv("VIEWER_EXIT_CORNER_PX")) != NULL)
@@ -714,6 +770,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: direct render must be 0 or 1, got %d\n", direct_render);
         return 1;
     }
+    if (touch_swap_xy != 0 && touch_swap_xy != 1) {
+        fprintf(stderr, "Error: touch axis swap must be 0 or 1, got %d\n", touch_swap_xy);
+        return 1;
+    }
+    if (touch_rotation == -1)
+        touch_rotation = rotation;
+    if (touch_rotation != 0 && touch_rotation != 90 &&
+        touch_rotation != 180 && touch_rotation != 270) {
+        fprintf(stderr, "Error: touch rotation must be 0, 90, 180, or 270, got %d\n",
+                touch_rotation);
+        return 1;
+    }
     if (exit_hold_ms < 0 || exit_hold_ms > 60000) {
         fprintf(stderr, "Error: hold-to-exit must be 0..60000 ms, got %d\n", exit_hold_ms);
         return 1;
@@ -739,6 +807,8 @@ int main(int argc, char **argv)
     ctx.touch.fd = -1;
     ctx.fb.use_backbuf = direct_render ? 0 : 1;
     ctx.xform.rotation = rotation;
+    ctx.xform.touch_rotation = touch_rotation;
+    ctx.xform.touch_swap_xy = touch_swap_xy;
     ctx.client_bpp = client_bpp;
     ctx.update_interval_ms = update_interval_ms;
     ctx.update_request_pending = FALSE;
@@ -832,9 +902,10 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            fprintf(stderr, "Connected to %s:%d (%dx%d), rotation=%d, depth=%d, update_interval=%dms, direct_render=%s\n",
+            fprintf(stderr, "Connected to %s:%d (%dx%d), rotation=%d, touch_rotation=%d, depth=%d, update_interval=%dms, direct_render=%s\n",
                     vnc_host, vnc_port,
-                    vnc_client->width, vnc_client->height, rotation, client_bpp, update_interval_ms,
+                    vnc_client->width, vnc_client->height, rotation, touch_rotation,
+                    client_bpp, update_interval_ms,
                     direct_render ? "on" : "off");
 
             /* Prime with one full update request. */
@@ -907,6 +978,9 @@ int main(int argc, char **argv)
                     ctx.touch.pressed = ev.value;
                 } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
                     int suppress_pointer = FALSE;
+
+                    if (ctx.touch.pressed)
+                        touch_maybe_use_fb_scale(&ctx);
 
                     if (ctx.exit_hold_ms > 0) {
                         if (!ctx.touch.pressed) {
