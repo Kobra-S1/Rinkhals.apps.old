@@ -896,7 +896,7 @@ int main(int argc, char **argv)
             if (!rfbInitClient(vnc_client, NULL, NULL)) {
                 fprintf(stderr, "Failed to connect to %s:%d, retrying in %dms\n",
                         vnc_host, vnc_port, reconnect_delay_ms);
-                rfbClientCleanup(vnc_client);
+                /* rfbInitClient already cleans up / frees the client on failure! */
                 vnc_client = NULL;
                 sleep_ms_interruptible(reconnect_delay_ms);
                 continue;
