@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <rfb/rfbclient.h>
@@ -77,6 +78,7 @@ struct viewer_ctx {
     int client_bpp;             /* requested VNC client bpp: 16 or 32 */
     int update_interval_ms;     /* throttle incremental update requests */
     int update_request_pending; /* TRUE after request sent, FALSE after reply */
+    int got_fb_update;          /* 1 when vnc_finished fires (real frame data) */
     int exit_hold_ms;           /* 0 disables local hold-to-exit */
     int exit_corner_px;         /* physical top-left trigger size, 0 = auto */
     int exit_move_tol_px;       /* allowed finger drift, 0 = auto */
@@ -480,7 +482,10 @@ static rfbBool vnc_resize(rfbClient *cl)
         cl->format.blueMax = 255;
     }
     cl->format.bigEndian = FALSE;
-    SetFormatAndEncodings(cl);
+    /* Don't call SetFormatAndEncodings here — the library calls it
+     * automatically after MallocFrameBuffer returns. Calling it twice
+     * sends duplicate SetPixelFormat/SetEncodings, which can confuse
+     * some VNC servers into not responding to FramebufferUpdateRequests. */
 
     if (cl->frameBuffer)
         free(cl->frameBuffer);
@@ -636,6 +641,7 @@ static void fb_flip(struct fb_state *fb)
 static void vnc_finished(rfbClient *cl)
 {
     struct viewer_ctx *ctx = rfbClientGetClientData(cl, vnc_client);
+    ctx->got_fb_update = 1;
     fb_flip(&ctx->fb);
 }
 
@@ -860,6 +866,11 @@ int main(int argc, char **argv)
     }
 
     long long next_update_request_ms = 0;
+    long long update_request_sent_ms = 0;
+    int update_timeout_count = 0;
+    int last_request_incremental = 0; /* track request type for timeout logic */
+    const int update_request_timeout_ms = 2500;
+    const int update_timeout_max = 3;  /* force reconnect after 3 consecutive non-incremental timeouts */
     const int reconnect_delay_ms = 5000;
     const int delayed_full_refresh_ms = 3000;
     long long delayed_full_refresh_at_ms = -1;
@@ -902,6 +913,15 @@ int main(int argc, char **argv)
                 continue;
             }
 
+            /* Set a receive timeout so HandleRFBServerMessage cannot
+             * block forever if the server stops sending mid-update. */
+            struct timeval recv_timeout;
+            recv_timeout.tv_sec = 10;
+            recv_timeout.tv_usec = 0;
+            if (setsockopt(vnc_client->sock, SOL_SOCKET, SO_RCVTIMEO,
+                           &recv_timeout, sizeof(recv_timeout)) < 0)
+                perror("setsockopt SO_RCVTIMEO");
+
             fprintf(stderr, "Connected to %s:%d (%dx%d), rotation=%d, touch_rotation=%d, depth=%d, update_interval=%dms, direct_render=%s\n",
                     vnc_host, vnc_port,
                     vnc_client->width, vnc_client->height, rotation, touch_rotation,
@@ -913,6 +933,9 @@ int main(int argc, char **argv)
                                          vnc_client->width, vnc_client->height,
                                          FALSE);
             ctx.update_request_pending = TRUE;
+            update_request_sent_ms = monotonic_ms();
+            last_request_incremental = 0;
+            update_timeout_count = 0;
             next_update_request_ms = monotonic_ms() + ctx.update_interval_ms;
             delayed_full_refresh_pending = TRUE;
             delayed_full_refresh_at_ms = monotonic_ms() + delayed_full_refresh_ms;
@@ -944,12 +967,17 @@ int main(int argc, char **argv)
         }
 
         /* Handle VNC data */
-        if (!disconnected && FD_ISSET(vnc_client->sock, &fds)) {
+        if (!disconnected && ret > 0 && FD_ISSET(vnc_client->sock, &fds)) {
             if (!HandleRFBServerMessage(vnc_client)) {
                 fprintf(stderr, "VNC connection lost\n");
                 disconnected = 1;
             }
             ctx.update_request_pending = FALSE;
+            /* Only reset timeout counter when actual framebuffer data arrived */
+            if (ctx.got_fb_update) {
+                update_timeout_count = 0;
+                ctx.got_fb_update = 0;
+            }
         }
 
         /* Handle touch events */
@@ -1042,6 +1070,39 @@ int main(int argc, char **argv)
             }
         }
 
+        /* Watchdog: if the server hasn't responded within the timeout.
+         * Incremental requests may legitimately get no response when the
+         * screen is idle (VNC protocol allows this).  Only count timeouts
+         * on NON-incremental requests as real failures. */
+        if (!disconnected && ctx.update_request_pending &&
+            (monotonic_ms() - update_request_sent_ms) >= update_request_timeout_ms) {
+            if (last_request_incremental) {
+                /* Incremental timed out — screen probably idle.
+                 * Re-send as non-incremental to probe server health. */
+                SendFramebufferUpdateRequest(vnc_client, 0, 0,
+                                             vnc_client->width, vnc_client->height,
+                                             FALSE);
+                last_request_incremental = 0;
+                update_request_sent_ms = monotonic_ms();
+                /* update_request_pending stays TRUE */
+            } else {
+                /* Non-incremental timed out — server is truly unresponsive */
+                update_timeout_count++;
+                fprintf(stderr, "Non-incremental request timed out (%d/%d)\n",
+                        update_timeout_count, update_timeout_max);
+                if (update_timeout_count >= update_timeout_max) {
+                    fprintf(stderr, "VNC server unresponsive, forcing reconnect\n");
+                    disconnected = 1;
+                } else {
+                    /* Retry non-incremental */
+                    SendFramebufferUpdateRequest(vnc_client, 0, 0,
+                                                 vnc_client->width, vnc_client->height,
+                                                 FALSE);
+                    update_request_sent_ms = monotonic_ms();
+                }
+            }
+        }
+
         if (!disconnected && !ctx.update_request_pending) {
             long long now_ms = monotonic_ms();
 
@@ -1050,6 +1111,8 @@ int main(int argc, char **argv)
                                              vnc_client->width, vnc_client->height,
                                              FALSE);
                 ctx.update_request_pending = TRUE;
+                update_request_sent_ms = now_ms;
+                last_request_incremental = 0;
                 delayed_full_refresh_pending = FALSE;
                 next_update_request_ms = now_ms + ctx.update_interval_ms;
                 fprintf(stderr, "Triggered delayed one-time full refresh\n");
@@ -1058,6 +1121,8 @@ int main(int argc, char **argv)
                                              vnc_client->width, vnc_client->height,
                                              TRUE);
                 ctx.update_request_pending = TRUE;
+                update_request_sent_ms = now_ms;
+                last_request_incremental = 1;
                 next_update_request_ms = now_ms + ctx.update_interval_ms;
             }
         }
@@ -1066,8 +1131,13 @@ int main(int argc, char **argv)
             rfbClientCleanup(vnc_client);
             vnc_client = NULL;
             ctx.update_request_pending = FALSE;
+            update_timeout_count = 0;
             delayed_full_refresh_pending = FALSE;
             delayed_full_refresh_at_ms = -1;
+            /* Clear display to avoid stale/squished image artifacts */
+            memset(ctx.fb.mem, 0, ctx.fb.stride * ctx.fb.height);
+            if (ctx.fb.use_backbuf)
+                memset(ctx.fb.backbuf, 0, ctx.fb.stride * ctx.fb.height);
             if (running) {
                 fprintf(stderr, "Reconnecting in %dms...\n", reconnect_delay_ms);
                 sleep_ms_interruptible(reconnect_delay_ms);
