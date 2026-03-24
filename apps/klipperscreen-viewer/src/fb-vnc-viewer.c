@@ -21,6 +21,9 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 #include <rfb/rfbclient.h>
@@ -197,6 +200,315 @@ static inline void fb_dirty(struct fb_state *fb, int y0, int y1)
         fb->dirty_min = y0;
     if (y1 > fb->dirty_max)
         fb->dirty_max = y1;
+}
+
+/* Forward declaration needed by fb_draw_status_lines */
+static void fb_flip(struct fb_state *fb);
+
+/* ── Embedded 5x7 bitmap font ────────────────────────────────── */
+
+/*
+ * Minimal bitmap font for on-screen status messages.
+ * Each glyph is 5 pixels wide x 7 pixels tall, stored as 7 bytes
+ * (one byte per row, MSB = leftmost pixel, only bits 7..3 used).
+ * Covers ASCII 32 (' ') through 126 ('~') -- 95 glyphs.
+ */
+
+#define FONT_W 5
+#define FONT_H 7
+#define FONT_FIRST 32
+#define FONT_LAST  126
+#define FONT_GLYPH_COUNT (FONT_LAST - FONT_FIRST + 1)
+
+static const uint8_t font5x7[FONT_GLYPH_COUNT][FONT_H] = {
+    /* 32 ' ' */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    /* 33 '!' */ {0x20,0x20,0x20,0x20,0x00,0x20,0x00},
+    /* 34 '"' */ {0x50,0x50,0x00,0x00,0x00,0x00,0x00},
+    /* 35 '#' */ {0x50,0xF8,0x50,0x50,0xF8,0x50,0x00},
+    /* 36 '$' */ {0x20,0x78,0xA0,0x70,0x28,0xF0,0x20},
+    /* 37 '%' */ {0xC8,0xD0,0x20,0x40,0x58,0x98,0x00},
+    /* 38 '&' */ {0x40,0xA0,0x40,0xA8,0x90,0x68,0x00},
+    /* 39 ''' */ {0x20,0x20,0x00,0x00,0x00,0x00,0x00},
+    /* 40 '(' */ {0x10,0x20,0x40,0x40,0x20,0x10,0x00},
+    /* 41 ')' */ {0x40,0x20,0x10,0x10,0x20,0x40,0x00},
+    /* 42 '*' */ {0x20,0xA8,0x70,0x20,0x70,0xA8,0x20},
+    /* 43 '+' */ {0x00,0x20,0x20,0xF8,0x20,0x20,0x00},
+    /* 44 ',' */ {0x00,0x00,0x00,0x00,0x20,0x20,0x40},
+    /* 45 '-' */ {0x00,0x00,0x00,0xF8,0x00,0x00,0x00},
+    /* 46 '.' */ {0x00,0x00,0x00,0x00,0x00,0x20,0x00},
+    /* 47 '/' */ {0x08,0x10,0x20,0x40,0x80,0x00,0x00},
+    /* 48 '0' */ {0x70,0x88,0x98,0xA8,0xC8,0x70,0x00},
+    /* 49 '1' */ {0x20,0x60,0x20,0x20,0x20,0x70,0x00},
+    /* 50 '2' */ {0x70,0x88,0x08,0x30,0x40,0xF8,0x00},
+    /* 51 '3' */ {0x70,0x88,0x30,0x08,0x88,0x70,0x00},
+    /* 52 '4' */ {0x10,0x30,0x50,0x90,0xF8,0x10,0x00},
+    /* 53 '5' */ {0xF8,0x80,0xF0,0x08,0x08,0xF0,0x00},
+    /* 54 '6' */ {0x30,0x40,0xF0,0x88,0x88,0x70,0x00},
+    /* 55 '7' */ {0xF8,0x08,0x10,0x20,0x40,0x40,0x00},
+    /* 56 '8' */ {0x70,0x88,0x70,0x88,0x88,0x70,0x00},
+    /* 57 '9' */ {0x70,0x88,0x88,0x78,0x10,0x60,0x00},
+    /* 58 ':' */ {0x00,0x00,0x20,0x00,0x20,0x00,0x00},
+    /* 59 ';' */ {0x00,0x00,0x20,0x00,0x20,0x20,0x40},
+    /* 60 '<' */ {0x08,0x10,0x20,0x40,0x20,0x10,0x08},
+    /* 61 '=' */ {0x00,0x00,0xF8,0x00,0xF8,0x00,0x00},
+    /* 62 '>' */ {0x80,0x40,0x20,0x10,0x20,0x40,0x80},
+    /* 63 '?' */ {0x70,0x88,0x10,0x20,0x00,0x20,0x00},
+    /* 64 '@' */ {0x70,0x88,0xB8,0xB8,0x80,0x70,0x00},
+    /* 65 'A' */ {0x70,0x88,0x88,0xF8,0x88,0x88,0x00},
+    /* 66 'B' */ {0xF0,0x88,0xF0,0x88,0x88,0xF0,0x00},
+    /* 67 'C' */ {0x70,0x88,0x80,0x80,0x88,0x70,0x00},
+    /* 68 'D' */ {0xF0,0x88,0x88,0x88,0x88,0xF0,0x00},
+    /* 69 'E' */ {0xF8,0x80,0xF0,0x80,0x80,0xF8,0x00},
+    /* 70 'F' */ {0xF8,0x80,0xF0,0x80,0x80,0x80,0x00},
+    /* 71 'G' */ {0x70,0x88,0x80,0xB8,0x88,0x70,0x00},
+    /* 72 'H' */ {0x88,0x88,0xF8,0x88,0x88,0x88,0x00},
+    /* 73 'I' */ {0x70,0x20,0x20,0x20,0x20,0x70,0x00},
+    /* 74 'J' */ {0x08,0x08,0x08,0x08,0x88,0x70,0x00},
+    /* 75 'K' */ {0x88,0x90,0xA0,0xC0,0xA0,0x90,0x88},
+    /* 76 'L' */ {0x80,0x80,0x80,0x80,0x80,0xF8,0x00},
+    /* 77 'M' */ {0x88,0xD8,0xA8,0x88,0x88,0x88,0x00},
+    /* 78 'N' */ {0x88,0xC8,0xA8,0x98,0x88,0x88,0x00},
+    /* 79 'O' */ {0x70,0x88,0x88,0x88,0x88,0x70,0x00},
+    /* 80 'P' */ {0xF0,0x88,0x88,0xF0,0x80,0x80,0x00},
+    /* 81 'Q' */ {0x70,0x88,0x88,0xA8,0x90,0x68,0x00},
+    /* 82 'R' */ {0xF0,0x88,0x88,0xF0,0xA0,0x90,0x00},
+    /* 83 'S' */ {0x70,0x80,0x70,0x08,0x08,0xF0,0x00},
+    /* 84 'T' */ {0xF8,0x20,0x20,0x20,0x20,0x20,0x00},
+    /* 85 'U' */ {0x88,0x88,0x88,0x88,0x88,0x70,0x00},
+    /* 86 'V' */ {0x88,0x88,0x88,0x50,0x50,0x20,0x00},
+    /* 87 'W' */ {0x88,0x88,0x88,0xA8,0xA8,0x50,0x00},
+    /* 88 'X' */ {0x88,0x50,0x20,0x20,0x50,0x88,0x00},
+    /* 89 'Y' */ {0x88,0x88,0x50,0x20,0x20,0x20,0x00},
+    /* 90 'Z' */ {0xF8,0x10,0x20,0x40,0x80,0xF8,0x00},
+    /* 91 '[' */ {0x70,0x40,0x40,0x40,0x40,0x70,0x00},
+    /* 92 '\' */ {0x80,0x40,0x20,0x10,0x08,0x00,0x00},
+    /* 93 ']' */ {0x70,0x10,0x10,0x10,0x10,0x70,0x00},
+    /* 94 '^' */ {0x20,0x50,0x88,0x00,0x00,0x00,0x00},
+    /* 95 '_' */ {0x00,0x00,0x00,0x00,0x00,0xF8,0x00},
+    /* 96 '`' */ {0x40,0x20,0x00,0x00,0x00,0x00,0x00},
+    /* 97 'a' */ {0x00,0x00,0x70,0x08,0x78,0x78,0x00},
+    /* 98 'b' */ {0x80,0x80,0xF0,0x88,0x88,0xF0,0x00},
+    /* 99 'c' */ {0x00,0x00,0x70,0x80,0x80,0x70,0x00},
+    /*100 'd' */ {0x08,0x08,0x78,0x88,0x88,0x78,0x00},
+    /*101 'e' */ {0x00,0x00,0x70,0x88,0xF0,0x70,0x00},
+    /*102 'f' */ {0x30,0x40,0xF0,0x40,0x40,0x40,0x00},
+    /*103 'g' */ {0x00,0x00,0x78,0x88,0x78,0x08,0x70},
+    /*104 'h' */ {0x80,0x80,0xF0,0x88,0x88,0x88,0x00},
+    /*105 'i' */ {0x20,0x00,0x60,0x20,0x20,0x70,0x00},
+    /*106 'j' */ {0x10,0x00,0x10,0x10,0x10,0x90,0x60},
+    /*107 'k' */ {0x80,0x80,0x90,0xA0,0xC0,0xA0,0x90},
+    /*108 'l' */ {0x60,0x20,0x20,0x20,0x20,0x70,0x00},
+    /*109 'm' */ {0x00,0x00,0xD0,0xA8,0xA8,0x88,0x00},
+    /*110 'n' */ {0x00,0x00,0xF0,0x88,0x88,0x88,0x00},
+    /*111 'o' */ {0x00,0x00,0x70,0x88,0x88,0x70,0x00},
+    /*112 'p' */ {0x00,0x00,0xF0,0x88,0xF0,0x80,0x80},
+    /*113 'q' */ {0x00,0x00,0x78,0x88,0x78,0x08,0x08},
+    /*114 'r' */ {0x00,0x00,0xB0,0xC8,0x80,0x80,0x00},
+    /*115 's' */ {0x00,0x00,0x78,0xC0,0x38,0xF0,0x00},
+    /*116 't' */ {0x40,0x40,0xF0,0x40,0x40,0x30,0x00},
+    /*117 'u' */ {0x00,0x00,0x88,0x88,0x88,0x78,0x00},
+    /*118 'v' */ {0x00,0x00,0x88,0x88,0x50,0x20,0x00},
+    /*119 'w' */ {0x00,0x00,0x88,0xA8,0xA8,0x50,0x00},
+    /*120 'x' */ {0x00,0x00,0x88,0x50,0x20,0x50,0x88},
+    /*121 'y' */ {0x00,0x00,0x88,0x88,0x78,0x08,0x70},
+    /*122 'z' */ {0x00,0x00,0xF8,0x10,0x20,0x40,0xF8},
+    /*123 '{' */ {0x10,0x20,0x20,0x40,0x20,0x20,0x10},
+    /*124 '|' */ {0x20,0x20,0x20,0x20,0x20,0x20,0x20},
+    /*125 '}' */ {0x40,0x20,0x20,0x10,0x20,0x20,0x40},
+    /*126 '~' */ {0x00,0x40,0xA8,0x10,0x00,0x00,0x00},
+};
+
+/* Write a single pixel to the framebuffer draw buffer. */
+static inline void fb_put_pixel(struct fb_state *fb, int x, int y,
+                                uint8_t r, uint8_t g, uint8_t b)
+{
+    if (x < 0 || x >= fb->width || y < 0 || y >= fb->height)
+        return;
+    uint8_t *p = fb->draw_mem + y * fb->stride + x * fb->bpp;
+    if (fb->bpp == 4) {
+        p[0] = b;
+        p[1] = g;
+        p[2] = r;
+        p[3] = 0xFF;
+    } else if (fb->bpp == 2) {
+        uint16_t c = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        p[0] = c & 0xFF;
+        p[1] = c >> 8;
+    }
+}
+
+/*
+ * Measure the pixel width of a string at a given scale.
+ * Each glyph is FONT_W*scale pixels, with 1*scale pixel gap between chars.
+ */
+static int text_width(const char *s, int scale)
+{
+    int len = 0;
+    while (*s++)
+        len++;
+    if (len == 0)
+        return 0;
+    return len * FONT_W * scale + (len - 1) * scale;
+}
+
+static int text_height(int scale)
+{
+    return FONT_H * scale;
+}
+
+/*
+ * Draw a string at (x0, y0) in framebuffer coordinates.
+ * scale enlarges each font pixel to a scale x scale block.
+ */
+static void fb_draw_text(struct fb_state *fb, int x0, int y0, int scale,
+                         uint8_t r, uint8_t g, uint8_t b, const char *s)
+{
+    int cx = x0;
+    for (; *s; s++) {
+        int ch = (unsigned char)*s;
+        if (ch < FONT_FIRST || ch > FONT_LAST)
+            ch = '?';
+        const uint8_t *glyph = font5x7[ch - FONT_FIRST];
+
+        for (int row = 0; row < FONT_H; row++) {
+            uint8_t bits = glyph[row];
+            for (int col = 0; col < FONT_W; col++) {
+                if (bits & (0x80 >> col)) {
+                    /* Fill a scale x scale block */
+                    for (int sy = 0; sy < scale; sy++)
+                        for (int sx = 0; sx < scale; sx++)
+                            fb_put_pixel(fb, cx + col * scale + sx,
+                                         y0 + row * scale + sy, r, g, b);
+                }
+            }
+        }
+        cx += (FONT_W + 1) * scale; /* advance + 1-pixel gap (scaled) */
+    }
+}
+
+/*
+ * Clear the screen and draw centered status lines.
+ *
+ * lines[]  = array of string pointers (NULL-terminated or bounded by nlines).
+ * nlines   = number of lines to draw.
+ *
+ * Chooses a scale factor so the text block is readable on any resolution
+ * from 272x480 portrait up to 800x480 landscape.  Each line is
+ * individually centered horizontally; the block is centered vertically.
+ */
+static void fb_draw_status_lines(struct fb_state *fb,
+                                 const char **lines, int nlines)
+{
+    /* Clear to black */
+    memset(fb->draw_mem, 0, fb->stride * fb->height);
+
+    if (!lines || nlines <= 0)
+        goto flip;
+
+    {
+        /* Pick scale based on the shortest screen dimension */
+        int min_dim = fb->width < fb->height ? fb->width : fb->height;
+        int scale = min_dim / (FONT_H * 10);
+        if (scale < 1)
+            scale = 1;
+
+        /* Shrink until the widest line fits within 90% of screen width */
+        for (int i = 0; i < nlines; i++)
+            while (scale > 1 && text_width(lines[i], scale) > fb->width * 9 / 10)
+                scale--;
+
+        int line_h = text_height(scale);
+        int gap = scale * 2;  /* vertical gap between lines */
+        int total_h = nlines * line_h + (nlines - 1) * gap;
+        int y = (fb->height - total_h) / 2;
+
+        for (int i = 0; i < nlines; i++) {
+            int tw = text_width(lines[i], scale);
+            int x = (fb->width - tw) / 2;
+            /* First line (status) brighter, detail lines dimmer */
+            if (i == 0)
+                fb_draw_text(fb, x, y, scale, 0xAA, 0xAA, 0xAA, lines[i]);
+            else
+                fb_draw_text(fb, x, y, scale, 0x66, 0x66, 0x66, lines[i]);
+            y += line_h + gap;
+        }
+    }
+
+flip:
+    fb_dirty(fb, 0, fb->height - 1);
+    fb_flip(fb);
+}
+
+/*
+ * Enumerate local non-loopback IPv4 addresses with their interface names.
+ * Writes lines like "wlan0: 192.168.1.42" into buf[0..max_entries-1].
+ * Each buf[i] must point to a char array of at least buf_sz bytes.
+ * Returns the number of entries written.
+ */
+static int get_local_ips(char buf[][64], int max_entries)
+{
+    struct ifaddrs *ifap = NULL, *ifa;
+    int count = 0;
+
+    if (getifaddrs(&ifap) != 0)
+        return 0;
+
+    for (ifa = ifap; ifa && count < max_entries; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr)
+            continue;
+        if (ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK)
+            continue;
+
+        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+        char addr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
+
+        snprintf(buf[count], 64, "%s: %s", ifa->ifa_name, addr);
+        count++;
+    }
+
+    freeifaddrs(ifap);
+    return count;
+}
+
+#define STATUS_MAX_LINES 12
+
+/*
+ * Draw a full status screen: status message, target host, and local IPs.
+ * Designed to be called from the reconnect / connecting paths.
+ */
+static void fb_draw_status_screen(struct fb_state *fb,
+                                  const char *status_msg,
+                                  const char *vnc_host, int vnc_port)
+{
+    const char *lines[STATUS_MAX_LINES];
+    int n = 0;
+
+    /* Line 0: main status */
+    lines[n++] = status_msg;
+
+    /* Line 1: blank separator (empty string = blank line) */
+    lines[n++] = "";
+
+    /* Line 2: target host */
+    char target_buf[80];
+    snprintf(target_buf, sizeof(target_buf), "Target: %s:%d", vnc_host, vnc_port);
+    lines[n++] = target_buf;
+
+    /* Lines 3+: local IPs */
+    char ip_bufs[8][64];
+    int ip_count = get_local_ips(ip_bufs, 8);
+
+    if (ip_count == 0) {
+        lines[n++] = "No network interfaces found";
+    } else {
+        for (int i = 0; i < ip_count && n < STATUS_MAX_LINES; i++)
+            lines[n++] = ip_bufs[i];
+    }
+
+    fb_draw_status_lines(fb, lines, n);
 }
 
 /* ── Touch input ─────────────────────────────────────────────── */
@@ -952,10 +1264,8 @@ int main(int argc, char **argv)
     ctx.xform.fb_width = ctx.fb.width;
     ctx.xform.fb_height = ctx.fb.height;
 
-    /* Clear screen and active draw buffer */
-    memset(ctx.fb.mem, 0, ctx.fb.stride * ctx.fb.height);
-    if (ctx.fb.use_backbuf)
-        memset(ctx.fb.backbuf, 0, ctx.fb.stride * ctx.fb.height);
+    /* Show initial status on screen */
+    fb_draw_status_screen(&ctx.fb, "Connecting...", vnc_host, vnc_port);
 
     /* Open touch */
     int have_touch = (touch_open(&ctx.touch, touch_device) == 0);
@@ -1007,6 +1317,7 @@ int main(int argc, char **argv)
 
             if (!vnc_client) {
                 fprintf(stderr, "rfbGetClient failed, retrying in %dms\n", reconnect_delay_ms);
+                fb_draw_status_screen(&ctx.fb, "Connection failed - retrying...", vnc_host, vnc_port);
                 sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
                 continue;
             }
@@ -1027,6 +1338,7 @@ int main(int argc, char **argv)
                         vnc_host, vnc_port, reconnect_delay_ms);
                 /* rfbInitClient already cleans up / frees the client on failure! */
                 vnc_client = NULL;
+                fb_draw_status_screen(&ctx.fb, "Connection failed - retrying...", vnc_host, vnc_port);
                 sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
                 continue;
             }
@@ -1166,13 +1478,16 @@ int main(int argc, char **argv)
             update_timeout_count = 0;
             delayed_full_refresh_pending = FALSE;
             delayed_full_refresh_at_ms = -1;
-            /* Clear display to avoid stale/squished image artifacts */
-            memset(ctx.fb.mem, 0, ctx.fb.stride * ctx.fb.height);
-            if (ctx.fb.use_backbuf)
-                memset(ctx.fb.backbuf, 0, ctx.fb.stride * ctx.fb.height);
+            /* Show reconnecting status instead of stale/squished image */
             if (running) {
+                fb_draw_status_screen(&ctx.fb, "Connection lost - reconnecting...", vnc_host, vnc_port);
                 fprintf(stderr, "Reconnecting in %dms...\n", reconnect_delay_ms);
                 sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
+            } else {
+                /* Shutting down — just clear to black */
+                memset(ctx.fb.mem, 0, ctx.fb.stride * ctx.fb.height);
+                if (ctx.fb.use_backbuf)
+                    memset(ctx.fb.backbuf, 0, ctx.fb.stride * ctx.fb.height);
             }
         }
     }
