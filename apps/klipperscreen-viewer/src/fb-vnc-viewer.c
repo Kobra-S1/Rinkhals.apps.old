@@ -104,15 +104,6 @@ static long long monotonic_ms(void)
     return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
 }
 
-static void sleep_ms_interruptible(int ms)
-{
-    while (running && ms > 0) {
-        int step = (ms > 200) ? 200 : ms;
-        usleep((unsigned int)step * 1000u);
-        ms -= step;
-    }
-}
-
 static uint32_t rgb565_to_bgra_lut[65536];
 static int rgb565_to_bgra_lut_ready = 0;
 
@@ -412,6 +403,133 @@ static void run_hold_exit_cmd(void)
     fprintf(stderr, "touch: running VIEWER_HOLD_EXIT_CMD\n");
     if (system(cmd) == -1)
         perror("system VIEWER_HOLD_EXIT_CMD");
+}
+
+static int maybe_trigger_hold_exit(struct viewer_ctx *ctx)
+{
+    long long now_ms;
+
+    if (ctx->exit_hold_ms <= 0 || !ctx->exit_hold_active || !ctx->touch.pressed)
+        return 0;
+
+    now_ms = monotonic_ms();
+    if ((now_ms - ctx->exit_hold_started_ms) < ctx->exit_hold_ms)
+        return 0;
+
+    fprintf(stderr, "touch: hold-to-exit triggered\n");
+    run_hold_exit_cmd();
+    running = 0;
+    return 1;
+}
+
+static void process_touch_events(struct viewer_ctx *ctx, int allow_pointer_forward)
+{
+    struct input_event ev;
+
+    while (read(ctx->touch.fd, &ev, sizeof(ev)) == sizeof(ev)) {
+        if (ev.type == EV_ABS) {
+            if (ev.code == ABS_MT_SLOT) {
+                /* Protocol B: subsequent MT events belong to this slot.
+                 * We only track slot 0 (first finger). */
+                ctx->touch.slot = ev.value;
+            } else if (ctx->touch.slot == 0) {
+                /* Only process events for slot 0 */
+                if (ev.code == ABS_X || ev.code == ABS_MT_POSITION_X)
+                    ctx->touch.x = ev.value;
+                else if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y)
+                    ctx->touch.y = ev.value;
+                else if (ev.code == ABS_MT_TRACKING_ID) {
+                    /* Protocol B: tracking_id >= 0 means finger down,
+                     * -1 means finger lifted. */
+                    ctx->touch.pressed = (ev.value != -1) ? 1 : 0;
+                }
+            }
+        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+            /* Protocol A fallback: some drivers still use BTN_TOUCH */
+            ctx->touch.pressed = ev.value;
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            int suppress_pointer = FALSE;
+
+            if (ctx->touch.pressed)
+                touch_maybe_use_fb_scale(ctx);
+
+            if (ctx->exit_hold_ms > 0) {
+                if (!ctx->touch.pressed) {
+                    if (ctx->exit_hold_active)
+                        fprintf(stderr, "touch: hold-to-exit canceled (release)\n");
+                    ctx->exit_hold_active = FALSE;
+                    ctx->exit_swallow_touch = FALSE;
+                    ctx->exit_hold_started_ms = -1;
+                } else if (!ctx->exit_swallow_touch) {
+                    int sx, sy;
+                    touch_to_view(&ctx->xform, &ctx->touch, ctx->touch.x, ctx->touch.y, &sx, &sy);
+                    if (sx >= 0 && sy >= 0 &&
+                        sx < ctx->exit_corner_px && sy < ctx->exit_corner_px) {
+                        ctx->exit_hold_active = TRUE;
+                        ctx->exit_swallow_touch = TRUE;
+                        ctx->exit_hold_started_ms = monotonic_ms();
+                        ctx->exit_hold_start_x = sx;
+                        ctx->exit_hold_start_y = sy;
+                        suppress_pointer = TRUE;
+                        fprintf(stderr,
+                                "touch: hold-to-exit tracking from (%d,%d), wait %dms\n",
+                                sx, sy, ctx->exit_hold_ms);
+                    }
+                } else if (ctx->exit_swallow_touch) {
+                    suppress_pointer = TRUE;
+                    if (ctx->exit_hold_active) {
+                        int sx, sy;
+                        int limit_px;
+                        touch_to_view(&ctx->xform, &ctx->touch, ctx->touch.x, ctx->touch.y, &sx, &sy);
+                        limit_px = ctx->exit_corner_px + ctx->exit_move_tol_px;
+                        if (sx < 0 || sy < 0 || sx >= limit_px || sy >= limit_px) {
+                            fprintf(stderr,
+                                    "touch: hold-to-exit canceled (moved to %d,%d)\n",
+                                    sx, sy);
+                            ctx->exit_hold_active = FALSE;
+                        }
+                    }
+                }
+            }
+
+            if (!suppress_pointer && allow_pointer_forward && vnc_client) {
+                int vx, vy;
+                touch_to_vnc(&ctx->xform, &ctx->touch,
+                             ctx->touch.x, ctx->touch.y, &vx, &vy);
+                SendPointerEvent(vnc_client, vx, vy,
+                                 ctx->touch.pressed ? rfbButton1Mask : 0);
+            }
+        }
+    }
+}
+
+static void sleep_ms_interruptible_with_touch(struct viewer_ctx *ctx, int have_touch, int ms)
+{
+    while (running && ms > 0) {
+        int step_ms = (ms > 50) ? 50 : ms;
+
+        if (have_touch && ctx->touch.fd >= 0) {
+            fd_set fds;
+            struct timeval tv;
+            int ret;
+
+            FD_ZERO(&fds);
+            FD_SET(ctx->touch.fd, &fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = step_ms * 1000;
+
+            ret = select(ctx->touch.fd + 1, &fds, NULL, NULL, &tv);
+            if (ret > 0 && FD_ISSET(ctx->touch.fd, &fds))
+                process_touch_events(ctx, FALSE);
+        } else {
+            usleep((unsigned int)step_ms * 1000u);
+        }
+
+        if (maybe_trigger_hold_exit(ctx))
+            return;
+
+        ms -= step_ms;
+    }
 }
 
 /*
@@ -889,7 +1007,7 @@ int main(int argc, char **argv)
 
             if (!vnc_client) {
                 fprintf(stderr, "rfbGetClient failed, retrying in %dms\n", reconnect_delay_ms);
-                sleep_ms_interruptible(reconnect_delay_ms);
+                sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
                 continue;
             }
 
@@ -909,7 +1027,7 @@ int main(int argc, char **argv)
                         vnc_host, vnc_port, reconnect_delay_ms);
                 /* rfbInitClient already cleans up / frees the client on failure! */
                 vnc_client = NULL;
-                sleep_ms_interruptible(reconnect_delay_ms);
+                sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
                 continue;
             }
 
@@ -981,99 +1099,13 @@ int main(int argc, char **argv)
         }
 
         /* Handle touch events */
-        if (!disconnected && have_touch && ctx.touch.fd >= 0 && FD_ISSET(ctx.touch.fd, &fds)) {
-            struct input_event ev;
-            while (read(ctx.touch.fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                if (ev.type == EV_ABS) {
-                    if (ev.code == ABS_MT_SLOT) {
-                        /* Protocol B: subsequent MT events belong to this slot.
-                         * We only track slot 0 (first finger). */
-                        ctx.touch.slot = ev.value;
-                    } else if (ctx.touch.slot == 0) {
-                        /* Only process events for slot 0 */
-                        if (ev.code == ABS_X || ev.code == ABS_MT_POSITION_X)
-                            ctx.touch.x = ev.value;
-                        else if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y)
-                            ctx.touch.y = ev.value;
-                        else if (ev.code == ABS_MT_TRACKING_ID) {
-                            /* Protocol B: tracking_id >= 0 means finger down,
-                             * -1 means finger lifted. */
-                            ctx.touch.pressed = (ev.value != -1) ? 1 : 0;
-                        }
-                    }
-                } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-                    /* Protocol A fallback: some drivers still use BTN_TOUCH */
-                    ctx.touch.pressed = ev.value;
-                } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-                    int suppress_pointer = FALSE;
+        if (have_touch && ctx.touch.fd >= 0 && ret > 0 && FD_ISSET(ctx.touch.fd, &fds))
+            process_touch_events(&ctx, !disconnected && vnc_client != NULL);
 
-                    if (ctx.touch.pressed)
-                        touch_maybe_use_fb_scale(&ctx);
+        if (maybe_trigger_hold_exit(&ctx))
+            continue;
 
-                    if (ctx.exit_hold_ms > 0) {
-                        if (!ctx.touch.pressed) {
-                            if (ctx.exit_hold_active)
-                                fprintf(stderr, "touch: hold-to-exit canceled (release)\n");
-                            ctx.exit_hold_active = FALSE;
-                            ctx.exit_swallow_touch = FALSE;
-                            ctx.exit_hold_started_ms = -1;
-                        } else if (!ctx.exit_swallow_touch) {
-                            int sx, sy;
-                            touch_to_view(&ctx.xform, &ctx.touch, ctx.touch.x, ctx.touch.y, &sx, &sy);
-                            if (sx >= 0 && sy >= 0 &&
-                                sx < ctx.exit_corner_px && sy < ctx.exit_corner_px) {
-                                ctx.exit_hold_active = TRUE;
-                                ctx.exit_swallow_touch = TRUE;
-                                ctx.exit_hold_started_ms = monotonic_ms();
-                                ctx.exit_hold_start_x = sx;
-                                ctx.exit_hold_start_y = sy;
-                                suppress_pointer = TRUE;
-                                fprintf(stderr,
-                                        "touch: hold-to-exit tracking from (%d,%d), wait %dms\n",
-                                        sx, sy, ctx.exit_hold_ms);
-                            }
-                        } else if (ctx.exit_swallow_touch) {
-                            suppress_pointer = TRUE;
-                            if (ctx.exit_hold_active) {
-                                int sx, sy;
-                                int limit_px;
-                                touch_to_view(&ctx.xform, &ctx.touch, ctx.touch.x, ctx.touch.y, &sx, &sy);
-                                limit_px = ctx.exit_corner_px + ctx.exit_move_tol_px;
-                                if (sx < 0 || sy < 0 || sx >= limit_px || sy >= limit_px) {
-                                    fprintf(stderr,
-                                            "touch: hold-to-exit canceled (moved to %d,%d)\n",
-                                            sx, sy);
-                                    ctx.exit_hold_active = FALSE;
-                                }
-                            }
-                        }
-                    }
-
-                    if (!suppress_pointer) {
-                        int vx, vy;
-                        touch_to_vnc(&ctx.xform, &ctx.touch,
-                                     ctx.touch.x, ctx.touch.y, &vx, &vy);
-                        SendPointerEvent(vnc_client, vx, vy,
-                                         ctx.touch.pressed ? rfbButton1Mask : 0);
-                    }
-                }
-            }
-        }
-
-        if (!disconnected && ctx.exit_hold_active && ctx.touch.pressed) {
-            long long now_ms = monotonic_ms();
-            if ((now_ms - ctx.exit_hold_started_ms) >= ctx.exit_hold_ms) {
-                fprintf(stderr, "touch: hold-to-exit triggered\n");
-                run_hold_exit_cmd();
-                running = 0;
-                continue;
-            }
-        }
-
-        /* Watchdog: if the server hasn't responded within the timeout.
-         * Incremental requests may legitimately get no response when the
-         * screen is idle (VNC protocol allows this).  Only count timeouts
-         * on NON-incremental requests as real failures. */
+        /* Past this point we only do VNC traffic / reconnect bookkeeping. */
         if (!disconnected && ctx.update_request_pending &&
             (monotonic_ms() - update_request_sent_ms) >= update_request_timeout_ms) {
             if (last_request_incremental) {
@@ -1140,7 +1172,7 @@ int main(int argc, char **argv)
                 memset(ctx.fb.backbuf, 0, ctx.fb.stride * ctx.fb.height);
             if (running) {
                 fprintf(stderr, "Reconnecting in %dms...\n", reconnect_delay_ms);
-                sleep_ms_interruptible(reconnect_delay_ms);
+                sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
             }
         }
     }
