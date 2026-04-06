@@ -338,6 +338,51 @@ static inline void fb_put_pixel(struct fb_state *fb, int x, int y,
 }
 
 /*
+ * Map a logical status-canvas pixel to framebuffer pixel coordinates
+ * using the same rotation model as VNC rendering.
+ */
+static inline void status_to_fb(int rotation, int status_w, int status_h,
+                                int fb_w, int fb_h, int sx, int sy,
+                                int *fx, int *fy)
+{
+    int fw = fb_w - 1;
+    int fh = fb_h - 1;
+
+    switch (rotation) {
+    case 90:
+        *fx = ((status_h - sy) * fw) / status_h;
+        *fy = (sx * fh) / status_w;
+        break;
+    case 180:
+        *fx = ((status_w - sx) * fw) / status_w;
+        *fy = ((status_h - sy) * fh) / status_h;
+        break;
+    case 270:
+        *fx = (sy * fw) / status_h;
+        *fy = ((status_w - sx) * fh) / status_w;
+        break;
+    default:
+        *fx = (sx * fw) / status_w;
+        *fy = (sy * fh) / status_h;
+        break;
+    }
+}
+
+static inline void fb_put_pixel_rotated(struct fb_state *fb, int rotation,
+                                        int status_w, int status_h, int x, int y,
+                                        uint8_t r, uint8_t g, uint8_t b)
+{
+    int fx, fy;
+
+    if (x < 0 || x >= status_w || y < 0 || y >= status_h)
+        return;
+
+    status_to_fb(rotation, status_w, status_h,
+                 fb->width, fb->height, x, y, &fx, &fy);
+    fb_put_pixel(fb, fx, fy, r, g, b);
+}
+
+/*
  * Measure the pixel width of a string at a given scale.
  * Each glyph is FONT_W*scale pixels, with 1*scale pixel gap between chars.
  */
@@ -360,7 +405,9 @@ static int text_height(int scale)
  * Draw a string at (x0, y0) in framebuffer coordinates.
  * scale enlarges each font pixel to a scale x scale block.
  */
-static void fb_draw_text(struct fb_state *fb, int x0, int y0, int scale,
+static void fb_draw_text(struct fb_state *fb, int rotation,
+                         int status_w, int status_h,
+                         int x0, int y0, int scale,
                          uint8_t r, uint8_t g, uint8_t b, const char *s)
 {
     int cx = x0;
@@ -377,8 +424,9 @@ static void fb_draw_text(struct fb_state *fb, int x0, int y0, int scale,
                     /* Fill a scale x scale block */
                     for (int sy = 0; sy < scale; sy++)
                         for (int sx = 0; sx < scale; sx++)
-                            fb_put_pixel(fb, cx + col * scale + sx,
-                                         y0 + row * scale + sy, r, g, b);
+                            fb_put_pixel_rotated(fb, rotation, status_w, status_h,
+                                                 cx + col * scale + sx,
+                                                 y0 + row * scale + sy, r, g, b);
                 }
             }
         }
@@ -396,9 +444,17 @@ static void fb_draw_text(struct fb_state *fb, int x0, int y0, int scale,
  * from 272x480 portrait up to 800x480 landscape.  Each line is
  * individually centered horizontally; the block is centered vertically.
  */
-static void fb_draw_status_lines(struct fb_state *fb,
+static void fb_draw_status_lines(struct fb_state *fb, int rotation,
                                  const char **lines, int nlines)
 {
+    int status_w = fb->width;
+    int status_h = fb->height;
+
+    if (rotation == 90 || rotation == 270) {
+        status_w = fb->height;
+        status_h = fb->width;
+    }
+
     /* Clear to black */
     memset(fb->draw_mem, 0, fb->stride * fb->height);
 
@@ -407,29 +463,31 @@ static void fb_draw_status_lines(struct fb_state *fb,
 
     {
         /* Pick scale based on the shortest screen dimension */
-        int min_dim = fb->width < fb->height ? fb->width : fb->height;
+        int min_dim = status_w < status_h ? status_w : status_h;
         int scale = min_dim / (FONT_H * 10);
         if (scale < 1)
             scale = 1;
 
         /* Shrink until the widest line fits within 90% of screen width */
         for (int i = 0; i < nlines; i++)
-            while (scale > 1 && text_width(lines[i], scale) > fb->width * 9 / 10)
+            while (scale > 1 && text_width(lines[i], scale) > status_w * 9 / 10)
                 scale--;
 
         int line_h = text_height(scale);
         int gap = scale * 2;  /* vertical gap between lines */
         int total_h = nlines * line_h + (nlines - 1) * gap;
-        int y = (fb->height - total_h) / 2;
+        int y = (status_h - total_h) / 2;
 
         for (int i = 0; i < nlines; i++) {
             int tw = text_width(lines[i], scale);
-            int x = (fb->width - tw) / 2;
+            int x = (status_w - tw) / 2;
             /* First line (status) brighter, detail lines dimmer */
             if (i == 0)
-                fb_draw_text(fb, x, y, scale, 0xAA, 0xAA, 0xAA, lines[i]);
+                fb_draw_text(fb, rotation, status_w, status_h,
+                             x, y, scale, 0xAA, 0xAA, 0xAA, lines[i]);
             else
-                fb_draw_text(fb, x, y, scale, 0x66, 0x66, 0x66, lines[i]);
+                fb_draw_text(fb, rotation, status_w, status_h,
+                             x, y, scale, 0x66, 0x66, 0x66, lines[i]);
             y += line_h + gap;
         }
     }
@@ -453,20 +511,36 @@ static int get_local_ips(char buf[][64], int max_entries)
     if (getifaddrs(&ifap) != 0)
         return 0;
 
-    for (ifa = ifap; ifa && count < max_entries; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr)
-            continue;
-        if (ifa->ifa_addr->sa_family != AF_INET)
-            continue;
-        if (ifa->ifa_flags & IFF_LOOPBACK)
-            continue;
+    for (int pass = 0; pass < 2 && count < max_entries; pass++) {
+        int want_preferred = (pass == 0);
 
-        struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
-        char addr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
+        for (ifa = ifap; ifa && count < max_entries; ifa = ifa->ifa_next) {
+            int is_preferred = 0;
 
-        snprintf(buf[count], 64, "%s: %s", ifa->ifa_name, addr);
-        count++;
+            if (!ifa->ifa_addr)
+                continue;
+            if (ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            if (ifa->ifa_flags & IFF_LOOPBACK)
+                continue;
+
+            if (ifa->ifa_name &&
+                (strncmp(ifa->ifa_name, "eth", 3) == 0 ||
+                 strncmp(ifa->ifa_name, "en", 2) == 0 ||
+                 strncmp(ifa->ifa_name, "wlan", 4) == 0 ||
+                 strncmp(ifa->ifa_name, "wl", 2) == 0))
+                is_preferred = 1;
+
+            if (is_preferred != want_preferred)
+                continue;
+
+            struct sockaddr_in *sin = (struct sockaddr_in *)ifa->ifa_addr;
+            char addr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
+
+            snprintf(buf[count], 64, "%s: %s", ifa->ifa_name, addr);
+            count++;
+        }
     }
 
     freeifaddrs(ifap);
@@ -479,7 +553,7 @@ static int get_local_ips(char buf[][64], int max_entries)
  * Draw a full status screen: status message, target host, and local IPs.
  * Designed to be called from the reconnect / connecting paths.
  */
-static void fb_draw_status_screen(struct fb_state *fb,
+static void fb_draw_status_screen(struct fb_state *fb, int rotation,
                                   const char *status_msg,
                                   const char *vnc_host, int vnc_port)
 {
@@ -508,7 +582,7 @@ static void fb_draw_status_screen(struct fb_state *fb,
             lines[n++] = ip_bufs[i];
     }
 
-    fb_draw_status_lines(fb, lines, n);
+    fb_draw_status_lines(fb, rotation, lines, n);
 }
 
 /* ── Touch input ─────────────────────────────────────────────── */
@@ -1265,7 +1339,7 @@ int main(int argc, char **argv)
     ctx.xform.fb_height = ctx.fb.height;
 
     /* Show initial status on screen */
-    fb_draw_status_screen(&ctx.fb, "Connecting...", vnc_host, vnc_port);
+    fb_draw_status_screen(&ctx.fb, ctx.xform.rotation, "Connecting...", vnc_host, vnc_port);
 
     /* Open touch */
     int have_touch = (touch_open(&ctx.touch, touch_device) == 0);
@@ -1317,7 +1391,8 @@ int main(int argc, char **argv)
 
             if (!vnc_client) {
                 fprintf(stderr, "rfbGetClient failed, retrying in %dms\n", reconnect_delay_ms);
-                fb_draw_status_screen(&ctx.fb, "Connection failed - retrying...", vnc_host, vnc_port);
+                fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
+                                      "Connection failed - retrying...", vnc_host, vnc_port);
                 sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
                 continue;
             }
@@ -1338,7 +1413,8 @@ int main(int argc, char **argv)
                         vnc_host, vnc_port, reconnect_delay_ms);
                 /* rfbInitClient already cleans up / frees the client on failure! */
                 vnc_client = NULL;
-                fb_draw_status_screen(&ctx.fb, "Connection failed - retrying...", vnc_host, vnc_port);
+                fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
+                                      "Connection failed - retrying...", vnc_host, vnc_port);
                 sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
                 continue;
             }
@@ -1480,7 +1556,8 @@ int main(int argc, char **argv)
             delayed_full_refresh_at_ms = -1;
             /* Show reconnecting status instead of stale/squished image */
             if (running) {
-                fb_draw_status_screen(&ctx.fb, "Connection lost - reconnecting...", vnc_host, vnc_port);
+                fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
+                                      "Connection lost - reconnecting...", vnc_host, vnc_port);
                 fprintf(stderr, "Reconnecting in %dms...\n", reconnect_delay_ms);
                 sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
             } else {
