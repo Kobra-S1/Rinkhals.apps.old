@@ -24,6 +24,30 @@ build/
 
 ---
 
+## Prerequisites: ARM Emulation
+
+If you attempt to build apps containing C code (like `klipperscreen-viewer`) and get an **exec format error** during the ARMv7 cross-compilation docker phase, your system is missing ARM emulation. 
+
+Enable it once on the host with the following command:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm
+```
+
+Alternatively (on Debian/Ubuntu systems), install the distribution packages:
+
+```bash
+sudo apt-get install -y qemu-user-static binfmt-support
+```
+
+Verify it works by running a simple ARM container test:
+
+```bash
+docker run --rm --platform=linux/arm/v7 debian:12 /bin/sh -lc 'uname -m'
+```
+
+---
+
 ## Build Docker Image
 
 The build image only needs rebuilding when `apps/Dockerfile` changes:
@@ -136,7 +160,7 @@ docker run --rm -it \
   /build/deploy-app.sh <app-name>
 ```
 
-The rclone sync skips `*.log`, `*.pyc`, `.enable`, `.disable`.
+The rclone sync skips `*.log`, `*.pyc`, `.enable`, `.disable`, `.enabled`, `.disabled`.
 
 After syncing, restart/test the app on the printer:
 
