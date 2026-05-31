@@ -919,6 +919,59 @@ static void sleep_ms_interruptible_with_touch(struct viewer_ctx *ctx, int have_t
 }
 
 /*
+ * Sleep up to `ms` while keeping touch responsive AND periodically
+ * redrawing the status screen.
+ *
+ * This periodic redraw is essential at startup: the launcher kills
+ * K3SysUi asynchronously (over several seconds), and that process
+ * repaints / owns the framebuffer, clobbering any status we drew before
+ * it finished dying.  A one-shot draw followed by a long sleep therefore
+ * leaves a black screen until the next reconnect attempt.  Redrawing
+ * every ~1s guarantees the status reappears shortly after K3SysUi is
+ * gone, regardless of how the connection failed.
+ */
+static void sleep_retry_with_status(struct viewer_ctx *ctx, int have_touch,
+                                    int ms, const char *status_msg,
+                                    const char *vnc_host, int vnc_port)
+{
+    const int redraw_interval_ms = 1000;
+    int since_redraw = redraw_interval_ms; /* force an immediate first draw */
+
+    while (running && ms > 0) {
+        if (since_redraw >= redraw_interval_ms) {
+            fb_draw_status_screen(&ctx->fb, ctx->xform.rotation,
+                                  status_msg, vnc_host, vnc_port);
+            since_redraw = 0;
+        }
+
+        int step_ms = (ms > 50) ? 50 : ms;
+
+        if (have_touch && ctx->touch.fd >= 0) {
+            fd_set fds;
+            struct timeval tv;
+            int ret;
+
+            FD_ZERO(&fds);
+            FD_SET(ctx->touch.fd, &fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = step_ms * 1000;
+
+            ret = select(ctx->touch.fd + 1, &fds, NULL, NULL, &tv);
+            if (ret > 0 && FD_ISSET(ctx->touch.fd, &fds))
+                process_touch_events(ctx, FALSE);
+        } else {
+            usleep((unsigned int)step_ms * 1000u);
+        }
+
+        if (maybe_trigger_hold_exit(ctx))
+            return;
+
+        ms -= step_ms;
+        since_redraw += step_ms;
+    }
+}
+
+/*
  * Map VNC server pixel (sx, sy) → framebuffer pixel (fx, fy),
  * applying scaling and rotation.
  */
@@ -1391,9 +1444,8 @@ int main(int argc, char **argv)
 
             if (!vnc_client) {
                 fprintf(stderr, "rfbGetClient failed, retrying in %dms\n", reconnect_delay_ms);
-                fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
-                                      "Connection failed - retrying...", vnc_host, vnc_port);
-                sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
+                sleep_retry_with_status(&ctx, have_touch, reconnect_delay_ms,
+                                        "Connection failed - retrying...", vnc_host, vnc_port);
                 continue;
             }
 
@@ -1403,7 +1455,14 @@ int main(int argc, char **argv)
             vnc_client->GetPassword = vnc_get_password;
             vnc_client->canHandleNewFBSize = TRUE;
 
+            /* Bound the TCP connect so an unreachable host fails fast (~5s) to avoid black screen*/
+            vnc_client->connectTimeout = 5;
+
             rfbClientSetClientData(vnc_client, vnc_client, &ctx);
+
+            /* Redraw the status screen on every attempt*/
+            fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
+                                  "Connecting...", vnc_host, vnc_port);
 
             /* Connect */
             vnc_client->serverHost = strdup(vnc_host);
@@ -1413,9 +1472,8 @@ int main(int argc, char **argv)
                         vnc_host, vnc_port, reconnect_delay_ms);
                 /* rfbInitClient already cleans up / frees the client on failure! */
                 vnc_client = NULL;
-                fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
-                                      "Connection failed - retrying...", vnc_host, vnc_port);
-                sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
+                sleep_retry_with_status(&ctx, have_touch, reconnect_delay_ms,
+                                        "Connection failed - retrying...", vnc_host, vnc_port);
                 continue;
             }
 
@@ -1556,10 +1614,9 @@ int main(int argc, char **argv)
             delayed_full_refresh_at_ms = -1;
             /* Show reconnecting status instead of stale/squished image */
             if (running) {
-                fb_draw_status_screen(&ctx.fb, ctx.xform.rotation,
-                                      "Connection lost - reconnecting...", vnc_host, vnc_port);
                 fprintf(stderr, "Reconnecting in %dms...\n", reconnect_delay_ms);
-                sleep_ms_interruptible_with_touch(&ctx, have_touch, reconnect_delay_ms);
+                sleep_retry_with_status(&ctx, have_touch, reconnect_delay_ms,
+                                        "Connection lost - reconnecting...", vnc_host, vnc_port);
             } else {
                 /* Shutting down — just clear to black */
                 memset(ctx.fb.mem, 0, ctx.fb.stride * ctx.fb.height);
