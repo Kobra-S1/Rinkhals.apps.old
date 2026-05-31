@@ -2,12 +2,6 @@
     "$version": "1",
 
     "name": "Klipper (vanilla)",
-    "description": "Vanilla Klipper to replace Anycubic GoKlipper reimplementation",
-    "version": "b7c0329f",
-
-    "upstream": {
-        "type": "github-branch-head",
-        "repo": "Klipper3d/klipper",
-        "branch": "master"
-    }
+    "description": "Vanilla Klipper to replace Anycubic GoKlipper reimplementation (with ACE support)",
+    "version": "0.3"
 }
