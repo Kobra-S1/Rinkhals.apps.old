@@ -28,6 +28,22 @@ if [ ! -f $APP_ROOT/app.sh ]; then
     exit 1
 fi
 
+if [ "$APP" = "klipperscreen-viewer" ]; then
+    if [ ! -x "$APP_ROOT/bin/fb-vnc-viewer" ]; then
+        echo "Missing $APP_ROOT/bin/fb-vnc-viewer"
+        echo "Build it first from repo root with: ./build/build-klipperscreen-viewer-swu.sh $KOBRA_MODEL_CODE"
+        echo "Or rebuild only the binary with: ./build/build-klipperscreen-viewer-bin.sh"
+        exit 1
+    fi
+
+    if [ "$APP_ROOT/src/fb-vnc-viewer.c" -nt "$APP_ROOT/bin/fb-vnc-viewer" ]; then
+        echo "$APP_ROOT/bin/fb-vnc-viewer is older than $APP_ROOT/src/fb-vnc-viewer.c"
+        echo "Rebuild with: ./build/build-klipperscreen-viewer-swu.sh $KOBRA_MODEL_CODE"
+        echo "Or rebuild only the binary with: ./build/build-klipperscreen-viewer-bin.sh"
+        exit 1
+    fi
+fi
+
 echo "Preparing update package for $APP..."
 
 mkdir -p /tmp/update_swu/$APP

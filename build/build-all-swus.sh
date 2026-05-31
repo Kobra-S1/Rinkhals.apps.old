@@ -18,6 +18,27 @@ for APP_ROOT in $(find /apps -type d -mindepth 1 -maxdepth 1); do
     fi
     
     APP=$(basename $APP_ROOT)
+
+    if [ "$APP" = "klipperscreen-viewer" ]; then
+        if [ ! -x "$APP_ROOT/bin/fb-vnc-viewer" ]; then
+            echo "Missing $APP_ROOT/bin/fb-vnc-viewer"
+            echo "Build it first from repo root with: ./build/build-klipperscreen-viewer-bin.sh"
+            exit 1
+        fi
+
+        if [ "$APP_ROOT/src/fb-vnc-viewer.c" -nt "$APP_ROOT/bin/fb-vnc-viewer" ]; then
+            echo "$APP_ROOT/bin/fb-vnc-viewer is older than $APP_ROOT/src/fb-vnc-viewer.c"
+            echo "Rebuild the binary first with: ./build/build-klipperscreen-viewer-bin.sh"
+            exit 1
+        fi
+
+        if [ "/build/build-klipperscreen-viewer-bin.sh" -nt "$APP_ROOT/bin/fb-vnc-viewer" ]; then
+            echo "$APP_ROOT/bin/fb-vnc-viewer is older than /build/build-klipperscreen-viewer-bin.sh"
+            echo "Rebuild the binary first with: ./build/build-klipperscreen-viewer-bin.sh"
+            exit 1
+        fi
+    fi
+
     echo "Preparing app package for $APP..."
 
     # Prepare update

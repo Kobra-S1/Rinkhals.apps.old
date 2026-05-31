@@ -28,5 +28,8 @@ fi
 echo "Syncing $APP to /useremain/home/rinkhals/apps/$APP..."
 
 rclone -v sync --absolute \
-    --filter "- /*.log" --filter "- *.pyc"  --filter "- /.enable" --filter "- /.disable" --filter "+ *" \
+    --filter "- /*.log" --filter "- *.pyc" \
+    --filter "- /.enable" --filter "- /.disable" \
+    --filter "- /.enabled" --filter "- /.disabled" \
+    --filter "+ *" \
     $APP_ROOT Kobra:/useremain/home/rinkhals/apps/$APP
