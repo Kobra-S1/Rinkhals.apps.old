@@ -44,8 +44,8 @@ fi
 cd klippy
 
 #Use tis klippy start line to enable logging for debugging
-#python -m klippy -a /tmp/unix_uds1 $CONFIG_DESTINATION >> /tmp/klippy.log 2>&1 &
+#nice -n -20 python -m klippy -a /tmp/unix_uds1 $CONFIG_DESTINATION >> /tmp/klippy.log 2>&1 &
 
 #Silent start to avoid filling up log with normal output, as it consumes space in /tmp folder RAMDisk
-python -m klippy -a /tmp/unix_uds1 "$CONFIG_DESTINATION" >/dev/null 2>&1 &
+nice -n -20 python -m klippy -a /tmp/unix_uds1 "$CONFIG_DESTINATION" >/dev/null 2>&1 &
 assert_by_name klippy
