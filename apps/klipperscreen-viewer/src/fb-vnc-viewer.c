@@ -142,6 +142,17 @@ static int fb_open(struct fb_state *fb, const char *device)
         return -1;
     }
 
+    /* Claim the display, not just the buffer: on DRM fbdev emulation the
+     * panel keeps scanning out the bootloader splash until something does a
+     * modeset (normally a compositor, or fbcon - absent on kiosk kernels).
+     * Writing the vinfo back forces set_par and with it the modeset;
+     * FB_ACTIVATE_FORCE because the vinfo is unchanged and the fb core
+     * would otherwise skip set_par entirely. Non-fatal: displays already
+     * scanning out fb memory don't need it. */
+    fb->vinfo.activate = FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+    if (ioctl(fb->fd, FBIOPUT_VSCREENINFO, &fb->vinfo) < 0)
+        perror("FBIOPUT_VSCREENINFO (continuing)");
+
     if (ioctl(fb->fd, FBIOGET_FSCREENINFO, &fb->finfo) < 0) {
         perror("FBIOGET_FSCREENINFO");
         close(fb->fd);
